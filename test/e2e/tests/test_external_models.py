@@ -72,6 +72,7 @@ def _subscription_ns():
 EXTERNAL_SUBSCRIPTION = os.environ.get("E2E_EXTERNAL_SUBSCRIPTION", "e2e-external-subscription")
 EXTERNAL_AUTH_POLICY = os.environ.get("E2E_EXTERNAL_AUTH_POLICY", "e2e-external-access")
 RECONCILE_WAIT = int(os.environ.get("E2E_RECONCILE_WAIT", "12"))
+EXTERNAL_MODEL_DATAPLANE_TIMEOUT = int(os.environ.get("E2E_EXTERNAL_MODEL_DATAPLANE_TIMEOUT", "180"))
 
 TARGET_MODEL = "gpt-3.5-turbo"
 
@@ -159,6 +160,73 @@ def _wait_for_external_model_route_name(model_name: str, *, timeout: int = 180) 
     raise AssertionError(
         f"ExternalModel {model_name} did not publish status.httpRouteName within {timeout}s: "
         f"{json.dumps(status)[:1000]}"
+    )
+
+
+def _wait_for_external_model_data_plane(
+    url: str,
+    api_key: str,
+    model_name: str,
+    *,
+    timeout: int = EXTERNAL_MODEL_DATAPLANE_TIMEOUT,
+) -> requests.Response:
+    """Wait for an ExternalModel request to reach its provider successfully.
+
+    Exercises the authenticated OpenAI chat path until the external-model
+    pre-processor has injected its routing candidate on the gateway replicas.
+    It retries only transient route-propagation responses and preserves other
+    failures as immediate, actionable test errors.
+
+    Args:
+        url: Full gateway URL for the ExternalModel inference route.
+        api_key: Subscription-bound API key that authorizes the request.
+        model_name: OpenAI model value used to select the ExternalModel.
+        timeout: Maximum number of seconds to wait for a successful response.
+
+    Returns:
+        The first successful provider response.
+
+    Raises:
+        AssertionError: If inference returns a non-transient failure or the
+            gateway does not reach the provider before the timeout.
+    """
+    deadline = time.monotonic() + timeout
+    last_detail = "no response"
+    while time.monotonic() < deadline:
+        try:
+            response = requests.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": "routing readiness"}],
+                    "max_tokens": 1,
+                },
+                timeout=30,
+                verify=TLS_VERIFY,
+            )
+        except requests.RequestException as exc:
+            last_detail = f"request error: {exc}"
+            log.info("ExternalModel data-plane readiness request failed (%s); retrying", exc)
+        else:
+            if response.status_code == 200:
+                return response
+            body = (response.text or "").strip()[:500]
+            last_detail = f"HTTP {response.status_code}: {body!r}"
+            if response.status_code not in (404, 500, 503):
+                raise AssertionError(
+                    f"ExternalModel {model_name} data-plane readiness failed: {last_detail}"
+                )
+            log.info(
+                "ExternalModel %s data plane is still propagating (%s); retrying",
+                model_name,
+                last_detail,
+            )
+        time.sleep(2)
+
+    raise AssertionError(
+        f"ExternalModel {model_name} did not reach its provider within {timeout}s; "
+        f"last result: {last_detail}"
     )
 
 
@@ -476,6 +544,11 @@ def external_token_limit_resources():
         api_key_id = key_data.get("id")
         if not api_key or not api_key_id:
             raise RuntimeError("External token-limit API key response omitted key or id")
+        _wait_for_external_model_data_plane(
+            f"{_gateway_url()}/{MODEL_NAMESPACE}/{model_name}/v1/chat/completions",
+            api_key,
+            model_name,
+        )
         yield {
             "api_key": api_key,
             "subscription": subscription_name,
@@ -564,8 +637,13 @@ def external_governance_scenario(external_governance_backends):
             response = _create_api_key_raw(owner_token, name=f"e2e-ext-gov-{suffix}-key-{index}", subscription=subscription)
             assert response.status_code in (200, 201), f"API key creation failed: {response.status_code} {response.text[:500]}"
             data = response.json()
-            cases.append(GovernedModelCase(model, ref, subscription, f"{_gateway_url()}/v1/chat/completions", model, "ExternalModel", f"{MODEL_NAMESPACE}/{ref}", data["key"], data["id"]))
             created[index - 1][2] = data["id"]
+            _wait_for_external_model_data_plane(
+                f"{_gateway_url()}/v1/chat/completions",
+                data["key"],
+                model,
+            )
+            cases.append(GovernedModelCase(model, ref, subscription, f"{_gateway_url()}/v1/chat/completions", model, "ExternalModel", f"{MODEL_NAMESPACE}/{ref}", data["key"], data["id"]))
         yield owner_token, tuple(cases)
     finally:
         for _auth, _subscription, key_id in reversed(created):
