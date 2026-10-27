@@ -564,7 +564,7 @@ def external_governance_scenario(external_governance_backends):
             response = _create_api_key_raw(owner_token, name=f"e2e-ext-gov-{suffix}-key-{index}", subscription=subscription)
             assert response.status_code in (200, 201), f"API key creation failed: {response.status_code} {response.text[:500]}"
             data = response.json()
-            cases.append(GovernedModelCase(model, ref, subscription, f"{_gateway_url()}/{MODEL_NAMESPACE}/{model}/v1/chat/completions", model, "ExternalModel", f"{MODEL_NAMESPACE}/{ref}", data["key"], data["id"]))
+            cases.append(GovernedModelCase(model, ref, subscription, f"{_gateway_url()}/v1/chat/completions", model, "ExternalModel", f"{MODEL_NAMESPACE}/{ref}", data["key"], data["id"]))
             created[index - 1][2] = data["id"]
         yield owner_token, tuple(cases)
     finally:
