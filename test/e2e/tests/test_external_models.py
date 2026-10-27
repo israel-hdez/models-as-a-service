@@ -42,6 +42,11 @@ from test_helper import (
     _wait_for_maas_subscription_phase,
     _wait_for_model_ready,
     _wait_for_subscription_inference_ready,
+    _wait_for_subscription_discovery_ready,
+    _wait_for_cr_absent,
+    _create_llmis,
+    _gateway_url,
+    _maas_api_url,
     _get_cluster_token,
     _create_api_key_raw,
     _create_test_auth_policy,
@@ -49,6 +54,12 @@ from test_helper import (
     _create_test_subscription,
     openai_usage_from_response,
     exercise_until_token_limited,
+)
+from governance_scenarios import (
+    GovernedModelCase,
+    assert_key_works,
+    assert_two_subscription_isolation,
+    wait_for_key_denied,
 )
 
 log = logging.getLogger(__name__)
@@ -115,6 +126,44 @@ def _poll_auth_denied(
         time.sleep(2)
     status = last.status_code if last is not None else "no response"
     raise AssertionError(f"Expected 401/403, got {status}")
+
+
+def _discover_simulator_service(llmis_name: str, timeout: int = 300) -> str:
+    """Return a ready simulator workload Service with its named HTTPS port."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        llmis = _get_cr("llminferenceservice", llmis_name, MODEL_NAMESPACE)
+        service_name = (((llmis or {}).get("status") or {}).get("workloads") or {}).get("service", {}).get("name")
+        service = _get_cr("service", service_name, MODEL_NAMESPACE) if service_name else None
+        ports = ((service or {}).get("spec") or {}).get("ports") or []
+        if service_name and any(
+            p.get("port") == 8000
+            and str(p.get("name", "")).lower().startswith("https")
+            for p in ports
+        ):
+            return service_name
+        time.sleep(2)
+    raise TimeoutError(f"LLMInferenceService {llmis_name} did not expose an HTTPS workload Service on port 8000")
+
+
+def _create_simulator_provider(provider_name: str, secret_name: str, llmis_name: str) -> None:
+    """Create a direct-Service TLS ExternalProvider for an in-cluster simulator."""
+    service_name = _discover_simulator_service(llmis_name)
+    _apply_cr({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": secret_name, "namespace": MODEL_NAMESPACE, "labels": {"inference.llm-d.ai/ipp-managed": "true"}}, "type": "Opaque", "stringData": {"api-key": "test-only-provider-credential"}})
+    _apply_cr({
+        "apiVersion": "inference.opendatahub.io/v1alpha1", "kind": "ExternalProvider",
+        "metadata": {"name": provider_name, "namespace": MODEL_NAMESPACE, "annotations": {"inference.opendatahub.io/port": "8000"}},
+        "spec": {"provider": "openai", "endpoint": f"{service_name}.{MODEL_NAMESPACE}.svc", "auth": {"type": "simple", "secretRef": {"name": secret_name}}, "config": {"tls.caCertificates": OPENSHIFT_SERVICE_CA_PATH}},
+    })
+
+
+def _external_inference(case, key):
+    return requests.post(
+        case.inference_url,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={"model": case.expected_catalog_id, "messages": [{"role": "user", "content": "hello"}]},
+        timeout=30, verify=TLS_VERIFY,
+    )
 
 
 # ─── Connectivity check ──────────────────────────────────────────────────────
@@ -324,54 +373,10 @@ def external_token_limit_resources():
     api_key_id = None
     oc_token = None
     try:
-        # The fixture is deployed by the aggregate kustomization; do not
-        # create a second simulator deployment or service.
-        deadline = time.monotonic() + 300
-        workload_service = None
-        while time.monotonic() < deadline:
-            llmis = _get_cr("llminferenceservice", EXTERNAL_TOKEN_LIMIT_LLMIS, MODEL_NAMESPACE)
-            workload_service = (
-                ((llmis or {}).get("status") or {}).get("workloads") or {}
-            ).get("service", {}).get("name")
-            service = _get_cr("service", workload_service, MODEL_NAMESPACE) if workload_service else None
-            service_ports = ((service or {}).get("spec") or {}).get("ports") or []
-            has_https_port = any(
-                port.get("port") == 8000 and str(port.get("name", "")).lower().startswith("https")
-                for port in service_ports
-            )
-            if llmis and workload_service and service and has_https_port:
-                break
-            time.sleep(2)
-        else:
-            raise TimeoutError(
-                "unconfigured simulator LLMInferenceService did not report a workload Service "
-                "with HTTPS port 8000"
-            )
-        # Target the workload Service directly: its cert is signed by the
-        # OpenShift service CA Envoy trusts, unlike Route ingress certs.
-        # endpoint is FQDN-only; the port goes in the ExternalProvider annotation.
-        provider_endpoint = f"{workload_service}.{MODEL_NAMESPACE}.svc"
-
-        _apply_cr({
-            "apiVersion": "v1", "kind": "Secret",
-            "metadata": {"name": secret_name, "namespace": MODEL_NAMESPACE,
-                         "labels": {"inference.llm-d.ai/ipp-managed": "true"}},
-            "type": "Opaque", "stringData": {"api-key": "test-only-provider-credential"},
-        })
-        _apply_cr({
-            "apiVersion": "inference.opendatahub.io/v1alpha1", "kind": "ExternalProvider",
-            "metadata": {
-                "name": provider_name,
-                "namespace": MODEL_NAMESPACE,
-                "annotations": {"inference.opendatahub.io/port": "8000"},
-            },
-            "spec": {
-                "provider": "openai",
-                "endpoint": provider_endpoint,
-                "auth": {"type": "simple", "secretRef": {"name": secret_name}},
-                "config": {"tls.caCertificates": OPENSHIFT_SERVICE_CA_PATH},
-            },
-        })
+        # Reuse the direct workload-Service TLS provider path used by the
+        # governance suite. It discovers KServe's generated Service name
+        # instead of guessing from the LLMInferenceService name.
+        _create_simulator_provider(provider_name, secret_name, EXTERNAL_TOKEN_LIMIT_LLMIS)
         _apply_cr({
             "apiVersion": "inference.opendatahub.io/v1alpha1", "kind": "ExternalModel",
             "metadata": {"name": model_name, "namespace": MODEL_NAMESPACE},
@@ -460,6 +465,102 @@ def external_token_limit_resources():
         _delete_cr(EXTERNAL_MODEL_KIND, model_name, MODEL_NAMESPACE)
         _delete_cr(EXTERNAL_PROVIDER_KIND, provider_name, MODEL_NAMESPACE)
         _delete_cr("secret", secret_name, MODEL_NAMESPACE)
+
+
+@pytest.fixture(scope="class")
+def external_governance_backends():
+    """Two independent, in-cluster ExternalModel paths for governance tests."""
+    suffix = uuid.uuid4().hex[:8]
+    dynamic_model = f"e2e-ext-gov-{suffix}"
+    dynamic_llmis = f"{dynamic_model}-backend"
+    fixed_model = EXTERNAL_TOKEN_LIMIT_MODEL
+    resources = []
+    if _get_cr(EXTERNAL_MODEL_KIND, fixed_model, MODEL_NAMESPACE) or _get_cr("maasmodelref", fixed_model, MODEL_NAMESPACE):
+        raise RuntimeError(
+            f"stale external governance fixture found for {fixed_model}; remove its ExternalModel and MaaSModelRef before retrying"
+        )
+    try:
+        _create_llmis(dynamic_llmis, MODEL_NAMESPACE, os.environ.get("GATEWAY_NAME", "maas-default-gateway"), model_name=dynamic_model)
+        for model, llmis in ((fixed_model, EXTERNAL_TOKEN_LIMIT_LLMIS), (dynamic_model, dynamic_llmis)):
+            prefix = f"{model}-gov-{suffix}"[:63]
+            provider, secret, ref = f"{prefix}-provider"[:63], f"{prefix}-credential"[:63], f"{prefix}-ref"[:63]
+            _create_simulator_provider(provider, secret, llmis)
+            _apply_cr({
+                "apiVersion": "inference.opendatahub.io/v1alpha1", "kind": "ExternalModel",
+                "metadata": {"name": model, "namespace": MODEL_NAMESPACE},
+                "spec": {"externalProviderRefs": [{"ref": {"name": provider}, "targetModel": model, "apiFormat": "openai-chat", "path": "/v1/chat/completions"}]},
+            })
+            _apply_cr({"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "MaaSModelRef", "metadata": {"name": ref, "namespace": MODEL_NAMESPACE}, "spec": {"modelRef": {"kind": "ExternalModel", "name": model}}})
+            _wait_for_model_ready(ref, namespace=MODEL_NAMESPACE, timeout=180)
+            route = ((_get_cr(EXTERNAL_MODEL_KIND, model, MODEL_NAMESPACE) or {}).get("status") or {}).get("httpRouteName")
+            if not route:
+                raise AssertionError(f"ExternalModel {model} did not publish status.httpRouteName")
+            _wait_for_httproute_accepted(route, namespace=MODEL_NAMESPACE, timeout=180)
+            resources.append((model, ref, provider, secret))
+        yield tuple(resources)
+    finally:
+        for model, ref, provider, secret in reversed(resources):
+            _delete_cr("maasmodelref", ref, MODEL_NAMESPACE)
+            _delete_cr(EXTERNAL_MODEL_KIND, model, MODEL_NAMESPACE)
+            _delete_cr(EXTERNAL_PROVIDER_KIND, provider, MODEL_NAMESPACE)
+            _delete_cr("secret", secret, MODEL_NAMESPACE)
+        _delete_cr("llminferenceservice", dynamic_llmis, MODEL_NAMESPACE)
+        _wait_for_cr_absent("llminferenceservice", dynamic_llmis, MODEL_NAMESPACE, timeout=120)
+
+
+@pytest.fixture
+def external_governance_scenario(external_governance_backends):
+    """Fresh policies, subscriptions, and explicitly bound keys per test."""
+    owner_token = _get_cluster_token()
+    suffix = uuid.uuid4().hex[:8]
+    created = []
+    cases = []
+    try:
+        for index, (model, ref, _provider, _secret) in enumerate(external_governance_backends, start=1):
+            auth, subscription = f"e2e-ext-gov-{suffix}-auth-{index}", f"e2e-ext-gov-{suffix}-sub-{index}"
+            _create_test_auth_policy(auth, [ref], groups=["system:authenticated"], model_namespace=MODEL_NAMESPACE)
+            _create_test_subscription(subscription, [ref], groups=["system:authenticated"], unlimited=True, model_namespace=MODEL_NAMESPACE)
+            _wait_for_maas_auth_policy_phase(auth, namespace=_subscription_ns(), timeout=180)
+            _wait_for_subscription_discovery_ready(subscription, namespace=_subscription_ns(), timeout=180)
+            _wait_for_subscription_inference_ready(subscription, ref, namespace=_subscription_ns(), model_namespace=MODEL_NAMESPACE, timeout=300)
+            response = _create_api_key_raw(owner_token, name=f"e2e-ext-gov-{suffix}-key-{index}", subscription=subscription)
+            assert response.status_code in (200, 201), f"API key creation failed: {response.status_code} {response.text[:500]}"
+            data = response.json()
+            cases.append(GovernedModelCase(model, ref, subscription, f"{_gateway_url()}/{MODEL_NAMESPACE}/{model}/v1/chat/completions", model, "ExternalModel", f"{MODEL_NAMESPACE}/{ref}", data["key"], data["id"]))
+            created.append((auth, subscription, data["id"]))
+        yield owner_token, tuple(cases)
+    finally:
+        for _auth, _subscription, key_id in reversed(created):
+            _revoke_api_key(owner_token, key_id)
+        for auth, subscription, _key_id in reversed(created):
+            _delete_cr("maassubscription", subscription, _subscription_ns())
+            _delete_cr("maasauthpolicy", auth, _subscription_ns())
+
+
+@pytest.mark.external
+@pytest.mark.serial
+@pytest.mark.xdist_group("external")
+class TestExternalModelGovernance:
+    def _list_models(self, key):
+        return requests.get(f"{_maas_api_url()}/v1/models", headers={"Authorization": f"Bearer {key}"}, timeout=30, verify=TLS_VERIFY)
+
+    def test_two_subscription_catalog_isolation(self, external_governance_scenario):
+        _owner, (case_a, case_b) = external_governance_scenario
+        assert_two_subscription_isolation(case_a, case_b, self._list_models, _external_inference)
+
+    def test_revoked_key_rejected_from_catalog_and_inference(self, external_governance_scenario):
+        owner, (case_a, _case_b) = external_governance_scenario
+        assert_key_works(case_a, self._list_models, _external_inference)
+        response = requests.delete(f"{_maas_api_url()}/v1/api-keys/{case_a.api_key_id}", headers={"Authorization": f"Bearer {owner}"}, timeout=30, verify=TLS_VERIFY)
+        assert response.status_code in (200, 204), f"key revocation failed: {response.status_code} {response.text[:500]}"
+        wait_for_key_denied(case_a, self._list_models, _external_inference, timeout=120)
+
+    def test_deleted_subscription_rejected_from_catalog_and_inference(self, external_governance_scenario):
+        _owner, (case_a, _case_b) = external_governance_scenario
+        assert_key_works(case_a, self._list_models, _external_inference)
+        _delete_cr("maassubscription", case_a.subscription_name, _subscription_ns())
+        _wait_for_cr_absent("maassubscription", case_a.subscription_name, _subscription_ns(), timeout=120)
+        wait_for_key_denied(case_a, self._list_models, _external_inference, expected_model_statuses=(403,), expected_list_statuses=(403,), timeout=120)
 
 
 # ─── Tests: Discovery ───────────────────────────────────────────────────────
