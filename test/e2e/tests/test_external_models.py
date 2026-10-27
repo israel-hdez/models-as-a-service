@@ -128,6 +128,40 @@ def _poll_auth_denied(
     raise AssertionError(f"Expected 401/403, got {status}")
 
 
+def _wait_for_external_model_route_name(model_name: str, *, timeout: int = 180) -> str:
+    """Wait for an ExternalModel reconciler to publish its generated route name.
+
+    Polls the ExternalModel status until the asynchronous reconciler records the
+    authoritative HTTPRoute name, so callers can subsequently wait for gateway
+    acceptance without racing resource creation.
+
+    Args:
+        model_name: Name of the ExternalModel in the configured model namespace.
+        timeout: Maximum time in seconds to wait for ``status.httpRouteName``.
+
+    Returns:
+        The generated HTTPRoute name reported by the ExternalModel.
+
+    Raises:
+        AssertionError: If the ExternalModel does not report a route name before
+            the timeout expires.
+    """
+    deadline = time.monotonic() + timeout
+    external_model = None
+    while time.monotonic() < deadline:
+        external_model = _get_cr(EXTERNAL_MODEL_KIND, model_name, MODEL_NAMESPACE)
+        route_name = ((external_model or {}).get("status") or {}).get("httpRouteName")
+        if route_name:
+            return route_name
+        time.sleep(2)
+
+    status = (external_model or {}).get("status", {})
+    raise AssertionError(
+        f"ExternalModel {model_name} did not publish status.httpRouteName within {timeout}s: "
+        f"{json.dumps(status)[:1000]}"
+    )
+
+
 def _discover_simulator_service(llmis_name: str, timeout: int = 300) -> str:
     """Return a ready simulator workload Service with its named HTTPS port."""
     deadline = time.monotonic() + timeout
@@ -393,13 +427,7 @@ def external_token_limit_resources():
         _create_test_subscription(subscription_name, [model_name], groups=["system:authenticated"],
                                   token_limit=token_limit, window=window, model_namespace=MODEL_NAMESPACE)
         _wait_for_model_ready(model_name, namespace=MODEL_NAMESPACE, timeout=180)
-        external_model = _get_cr(EXTERNAL_MODEL_KIND, model_name, MODEL_NAMESPACE)
-        external_http_route_name = ((external_model or {}).get("status") or {}).get("httpRouteName")
-        if not external_http_route_name:
-            raise AssertionError(
-                f"ExternalModel {model_name} did not report status.httpRouteName: "
-                f"{json.dumps((external_model or {}).get('status', {}))[:1000]}"
-            )
+        external_http_route_name = _wait_for_external_model_route_name(model_name)
         _wait_for_httproute_accepted(external_http_route_name, namespace=MODEL_NAMESPACE, timeout=180)
         _wait_for_maas_subscription_phase(subscription_name, timeout=180)
         _wait_for_subscription_inference_ready(subscription_name, model_name, model_namespace=MODEL_NAMESPACE, timeout=300)
@@ -495,9 +523,7 @@ def external_governance_backends():
                 "spec": {"externalProviderRefs": [{"ref": {"name": provider}, "targetModel": model, "apiFormat": "openai-chat", "path": "/v1/chat/completions"}]},
             })
             _apply_cr({"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "MaaSModelRef", "metadata": {"name": ref, "namespace": MODEL_NAMESPACE}, "spec": {"modelRef": {"kind": "ExternalModel", "name": model}}})
-            route = ((_get_cr(EXTERNAL_MODEL_KIND, model, MODEL_NAMESPACE) or {}).get("status") or {}).get("httpRouteName")
-            if not route:
-                raise AssertionError(f"ExternalModel {model} did not publish status.httpRouteName")
+            route = _wait_for_external_model_route_name(model)
             _wait_for_httproute_accepted(route, namespace=MODEL_NAMESPACE, timeout=180)
         yield tuple(resources)
     finally:
