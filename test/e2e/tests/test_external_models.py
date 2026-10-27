@@ -484,6 +484,10 @@ def external_governance_backends():
         for model, llmis in ((fixed_model, EXTERNAL_TOKEN_LIMIT_LLMIS), (dynamic_model, dynamic_llmis)):
             prefix = f"{model}-gov-{suffix}"[:63]
             provider, secret, ref = f"{prefix}-provider"[:63], f"{prefix}-credential"[:63], f"{prefix}-ref"[:63]
+            # Track ownership before provisioning so finally also removes a
+            # partially-created Secret, ExternalProvider, ExternalModel, or
+            # MaaSModelRef when any later setup step fails.
+            resources.append((model, ref, provider, secret))
             _create_simulator_provider(provider, secret, llmis)
             _apply_cr({
                 "apiVersion": "inference.opendatahub.io/v1alpha1", "kind": "ExternalModel",
@@ -491,12 +495,10 @@ def external_governance_backends():
                 "spec": {"externalProviderRefs": [{"ref": {"name": provider}, "targetModel": model, "apiFormat": "openai-chat", "path": "/v1/chat/completions"}]},
             })
             _apply_cr({"apiVersion": "maas.opendatahub.io/v1alpha1", "kind": "MaaSModelRef", "metadata": {"name": ref, "namespace": MODEL_NAMESPACE}, "spec": {"modelRef": {"kind": "ExternalModel", "name": model}}})
-            _wait_for_model_ready(ref, namespace=MODEL_NAMESPACE, timeout=180)
             route = ((_get_cr(EXTERNAL_MODEL_KIND, model, MODEL_NAMESPACE) or {}).get("status") or {}).get("httpRouteName")
             if not route:
                 raise AssertionError(f"ExternalModel {model} did not publish status.httpRouteName")
             _wait_for_httproute_accepted(route, namespace=MODEL_NAMESPACE, timeout=180)
-            resources.append((model, ref, provider, secret))
         yield tuple(resources)
     finally:
         for model, ref, provider, secret in reversed(resources):
@@ -518,8 +520,18 @@ def external_governance_scenario(external_governance_backends):
     try:
         for index, (model, ref, _provider, _secret) in enumerate(external_governance_backends, start=1):
             auth, subscription = f"e2e-ext-gov-{suffix}-auth-{index}", f"e2e-ext-gov-{suffix}-sub-{index}"
+            # Register cleanup before creation in case either governance
+            # resource fails to be applied.
+            created.append([auth, subscription, None])
             _create_test_auth_policy(auth, [ref], groups=["system:authenticated"], model_namespace=MODEL_NAMESPACE)
             _create_test_subscription(subscription, [ref], groups=["system:authenticated"], unlimited=True, model_namespace=MODEL_NAMESPACE)
+
+        # GovernanceAttached cannot become true until the policy and
+        # subscription above exist, so model readiness must be awaited here
+        # rather than in external_governance_backends.
+        for index, (model, ref, _provider, _secret) in enumerate(external_governance_backends, start=1):
+            auth, subscription, _key_id = created[index - 1]
+            _wait_for_model_ready(ref, namespace=MODEL_NAMESPACE, timeout=180)
             _wait_for_maas_auth_policy_phase(auth, namespace=_subscription_ns(), timeout=180)
             _wait_for_subscription_discovery_ready(subscription, namespace=_subscription_ns(), timeout=180)
             _wait_for_subscription_inference_ready(subscription, ref, namespace=_subscription_ns(), model_namespace=MODEL_NAMESPACE, timeout=300)
@@ -527,11 +539,12 @@ def external_governance_scenario(external_governance_backends):
             assert response.status_code in (200, 201), f"API key creation failed: {response.status_code} {response.text[:500]}"
             data = response.json()
             cases.append(GovernedModelCase(model, ref, subscription, f"{_gateway_url()}/{MODEL_NAMESPACE}/{model}/v1/chat/completions", model, "ExternalModel", f"{MODEL_NAMESPACE}/{ref}", data["key"], data["id"]))
-            created.append((auth, subscription, data["id"]))
+            created[index - 1][2] = data["id"]
         yield owner_token, tuple(cases)
     finally:
         for _auth, _subscription, key_id in reversed(created):
-            _revoke_api_key(owner_token, key_id)
+            if key_id:
+                _revoke_api_key(owner_token, key_id)
         for auth, subscription, _key_id in reversed(created):
             _delete_cr("maassubscription", subscription, _subscription_ns())
             _delete_cr("maasauthpolicy", auth, _subscription_ns())
